@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 
 from mypylibs.calibration import select_calibration_frames, calibrate, draw_corners
+from mypylibs.pose import FRAME_GAP, estimate_scene_poses, rotation_deg, draw_flow
+from mypylibs.video import read_video_frames
 
 ROOT_IN = 'in'
 ROOT_OUT = 'out'
@@ -62,7 +64,50 @@ def process_camera(cam):
     calib = calibrate(selected)
     for line in save_calibration(cam, selected, calib)[:8]:
         print(f'[{cam}]   {line}')
+
+    scenes = sorted(glob.glob(opath.join(ROOT_IN, f'{cam}_[0-9][0-9].mp4')))
+    for scene in scenes:
+        process_scene(cam, opath.basename(scene)[3:5], scene, calib)
     return calib
+
+
+def save_poses(name, poses):
+    """Per-pair pose summary: matches, inliers, rotation and translation direction."""
+    rows = []
+    for p in poses:
+        if p['ok']:
+            rows.append([p['i'], p['j'], 1, p['n_matches'], p['n_inliers'],
+                         rotation_deg(p['R']), *p['t']])
+        else:
+            rows.append([p['i'], p['j'], 0, p['n_matches'], 0, np.nan, np.nan, np.nan, np.nan])
+    np.savetxt(opath.join(ROOT_OUT, f'{name}_poses.csv'), np.array(rows, float),
+               delimiter=',', fmt='%.5f',
+               header='frame_i,frame_j,ok,n_matches,n_inliers,rotation_deg,tx,ty,tz')
+
+
+def process_scene(cam, scene_id, path, calib):
+    name = f'{cam}-{scene_id}'
+    K, D = calib['K'], calib['D']
+    frames, _ = read_video_frames(path)
+
+    print(f'[{name}] Step 5: SIFT matching and relative pose, frame t vs t+{FRAME_GAP} '
+          f'({len(frames)} frames)')
+    poses = estimate_scene_poses(frames, K, D)
+    save_poses(name, poses)
+
+    ok = [p for p in poses if p['ok']]
+    print(f'[{name}]   {len(ok)}/{len(poses)} pairs with a valid pose')
+    if ok:
+        t = np.array([p['t'] for p in ok])
+        print(f'[{name}]   median matches {np.median([p["n_matches"] for p in ok]):.0f}, '
+              f'inliers {np.median([p["n_inliers"] for p in ok]):.0f}, '
+              f'rotation {np.median([rotation_deg(p["R"]) for p in ok]):.2f} deg')
+        print(f'[{name}]   median |t| (x, y, z) = '
+              f'{tuple(np.round(np.median(np.abs(t), axis=0), 2))}')
+        mid = ok[len(ok) // 2]
+        cv2.imwrite(opath.join(ROOT_OUT, f'{name}_matches.jpg'),
+                    draw_flow(frames[mid['i']], mid['p0'], mid['p1']))
+    return poses
 
 
 def main():
