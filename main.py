@@ -11,6 +11,7 @@ from mypylibs.video import read_video_frames
 from mypylibs.scale import BoardTrack
 from mypylibs.stereo import make_matcher, rectified_depth, board_depth_error
 from mypylibs.render import DepthVideoWriter
+from mypylibs.pointcloud import depth_to_cloud, write_ply
 
 ROOT_IN = 'in'
 ROOT_OUT = 'out'
@@ -148,12 +149,14 @@ def depth_video(name, frames, poses, K, D):
         res['i'], res['j'] = i, j
         results.append(res)
 
+        res['board_err'] = np.nan
         board = track.board_points_in_camera(i)
         if board is not None:
             e, z = board_depth_error(res, board)
             if len(e):
                 errors.append(e)
                 true_z.append(z)
+                res['board_err'] = float(np.median(np.abs(e)))
 
     if not results:
         print(f'[{name}]   no usable frame pairs')
@@ -192,6 +195,27 @@ def depth_video(name, frames, poses, K, D):
             writer.snapshot(opath.join(ROOT_OUT, f'{name}_depth.png'))
     writer.close()
     print(f'[{name}]   depth video -> {out}')
+
+    save_point_cloud(name, results)
+
+
+def save_point_cloud(name, results):
+    """Bonus: coloured .ply point cloud of one depth frame. The frame is the
+    one with the best board accuracy among the half with most valid pixels."""
+    cover = np.array([np.isfinite(r['Z']).mean() for r in results])
+    err = np.array([r['board_err'] for r in results])
+    cand = np.nonzero(cover >= np.median(cover))[0]
+    if np.isfinite(err[cand]).any():
+        best = cand[np.nanargmin(err[cand])]
+    else:
+        best = cand[np.argmax(cover[cand])]
+    r = results[best]
+    xyz, rgb = depth_to_cloud(r)
+    out = opath.join(ROOT_OUT, f'{name}.ply')
+    write_ply(out, xyz, rgb)
+    print(f'[{name}]   bonus point cloud -> {out}: {len(xyz)} points from frames '
+          f'{r["i"]}-{r["j"]} (valid pixels {cover[best]:.0%}, board |error| '
+          f'{err[best]:.1f} cm)')
 
 
 def main():
