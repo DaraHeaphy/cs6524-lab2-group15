@@ -8,9 +8,17 @@ import numpy as np
 from mypylibs.calibration import select_calibration_frames, calibrate, draw_corners
 from mypylibs.pose import FRAME_GAP, estimate_scene_poses, rotation_deg, draw_flow
 from mypylibs.video import read_video_frames
+from mypylibs.scale import BoardTrack
+from mypylibs.stereo import make_matcher, rectified_depth, board_depth_error
+from mypylibs.render import DepthVideoWriter
 
 ROOT_IN = 'in'
 ROOT_OUT = 'out'
+
+# Pose used to rectify each pair: 'sift' = Step 5 estimate (README pipeline),
+# 'board' = solvePnP on the checkerboard in the scene. In both cases the metric
+# baseline B comes from the board.
+RECTIFY_POSE = 'sift'
 
 
 def save_corner_overlays(cam, selected):
@@ -107,7 +115,83 @@ def process_scene(cam, scene_id, path, calib):
         mid = ok[len(ok) // 2]
         cv2.imwrite(opath.join(ROOT_OUT, f'{name}_matches.jpg'),
                     draw_flow(frames[mid['i']], mid['p0'], mid['p1']))
+
+    depth_video(name, frames, poses, K, D)
     return poses
+
+
+def depth_video(name, frames, poses, K, D):
+    print(f'[{name}] Step 6: rectification, SGBM disparity and depth '
+          f'(rectified with {RECTIFY_POSE} pose)')
+    track = BoardTrack(frames, K, D)
+    if not track.ok:
+        print(f'[{name}]   checkerboard not found in enough frames: no metric '
+              f'baseline, skipping depth')
+        return
+    print(f'[{name}]   board found in {len(track.frames)}/{len(frames)} frames, '
+          f'PnP jitter around smoothed path {np.round(track.jitter_cm, 2)} cm')
+
+    matcher = make_matcher()
+    results, errors, true_z = [], [], []
+    for p in poses:
+        i, j = p['i'], p['j']
+        if not p['ok'] or not (track.covers(i) and track.covers(j)):
+            continue
+        if RECTIFY_POSE == 'board':
+            if i not in track.R or j not in track.R:
+                continue
+            R, t = track.relative_pose(i, j)
+        else:
+            R, t = p['R'], p['t']
+        B = track.baseline(i, j)
+        res = rectified_depth(frames[i], frames[j], K, D, R, t, B, matcher)
+        res['i'], res['j'] = i, j
+        results.append(res)
+
+        board = track.board_points_in_camera(i)
+        if board is not None:
+            e, z = board_depth_error(res, board)
+            if len(e):
+                errors.append(e)
+                true_z.append(z)
+
+    if not results:
+        print(f'[{name}]   no usable frame pairs')
+        return
+
+    allZ = np.concatenate([r['Z'][np.isfinite(r['Z'])] for r in results])
+    zmin = max(10, np.floor(np.percentile(allZ, 1) / 5) * 5)
+    zmax = np.ceil(np.percentile(allZ, 99) / 50) * 50
+    coverage = np.mean([np.isfinite(r['Z']).mean() for r in results])
+    baselines = [r['B'] for r in results]
+    print(f'[{name}]   {len(results)} depth frames, baseline {min(baselines):.2f}-'
+          f'{max(baselines):.2f} cm, valid pixels {coverage:.0%}, colour range '
+          f'{zmin:.0f}-{zmax:.0f} cm')
+
+    summary = [f'Scene {name}: {len(results)} depth frames, rectified with {RECTIFY_POSE} pose',
+               f'baseline B: min {min(baselines):.2f}, median {np.median(baselines):.2f}, '
+               f'max {max(baselines):.2f} cm',
+               f'valid depth pixels: {coverage:.1%}']
+    if errors:
+        e = np.concatenate(errors)
+        line = (f'board check: true depth ~{np.median(true_z):.1f} cm, error median '
+                f'{np.median(e):+.1f} cm, median |error| {np.median(np.abs(e)):.1f} cm '
+                f'({len(errors)} frames)')
+        summary.append(line)
+        print(f'[{name}]   {line}')
+    with open(opath.join(ROOT_OUT, f'{name}_depth.txt'), 'w') as f:
+        f.write('\n'.join(summary) + '\n')
+
+    h, w = frames[0].shape[:2]
+    out = opath.join(ROOT_OUT, f'{name}.mp4')
+    writer = DepthVideoWriter(out, (h, w), zmin, zmax, title=f'Scene {name}')
+    mid = len(results) // 2
+    for k, r in enumerate(results):
+        writer.write(r['rect'], r['Z'], f'frames {r["i"]}-{r["j"]}, B = {r["B"]:.1f} cm')
+        if k == mid:
+            writer.snapshot(opath.join(ROOT_OUT, f'{name}_depth.png'))
+    writer.close()
+    print(f'[{name}]   depth video -> {out}')
 
 
 def main():
