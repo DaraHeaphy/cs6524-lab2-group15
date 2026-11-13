@@ -89,7 +89,8 @@ def calibrate(selected, pattern_size=PATTERN_SIZE, square=SQUARE_SIZE_CM):
     per_frame, all_err = [], []
     for pts, r, t in zip(img_pts, rvecs, tvecs):
         proj, _ = cv2.projectPoints(obj, r, t, K, D)
-        err = np.linalg.norm(proj[:, 0] - pts[:, 0], axis=1)
+        # Corner arrays are (N,1,2) or (N,2) depending on the OpenCV version.
+        err = np.linalg.norm(proj.reshape(-1, 2) - pts.reshape(-1, 2), axis=1)
         all_err.append(err)
         per_frame.append(err.mean())
     all_err = np.concatenate(all_err)
